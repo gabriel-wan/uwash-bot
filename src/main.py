@@ -133,28 +133,13 @@ def main():
         send_alarms, interval=datetime.timedelta(seconds=30)
     )
 
+    # Start Flask API in background thread (uses PORT env var for Railway)
     threading.Thread(target=start_api, daemon=True).start()
 
-    # Check for production mode via env var or config
-    is_production = os.environ.get("PRODUCTION", "").lower() == "true" or config.get("PRODUCTION")
-
-    if is_production:
-        webhook_url = os.environ.get("WEBHOOK_URL") or config.get("WEBHOOK_URL")
-        port = int(os.environ.get("PORT", config.get("PORT", 8443)))
-
-        if webhook_url:
-            logger.info(f"Running on webhook: {webhook_url}")
-            application.run_webhook(
-                listen="0.0.0.0",
-                port=port,
-                webhook_url=webhook_url,
-            )
-        else:
-            logger.warning("PRODUCTION=true but no WEBHOOK_URL set, falling back to polling")
-            application.run_polling(drop_pending_updates=True)
-    else:
-        logger.info("Running in polling mode")
-        application.run_polling(drop_pending_updates=True)
+    # Always use polling mode - Flask API needs the port for dashboard/sensors
+    # Polling works by making outbound requests to Telegram, no port needed
+    logger.info("Starting bot in polling mode...")
+    application.run_polling(drop_pending_updates=True)
 
 
 async def send_alarms(context: CallbackContext):
