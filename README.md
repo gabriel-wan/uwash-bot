@@ -106,7 +106,7 @@ const char* MACHINE_NAME = "Washer One";
 ## Team
 
 
-Built for NUS UTown Student Life Hackathon 2026
+Built for NUS Student Life Track Hackathon 2026
 
 ## Contributors
 
@@ -117,7 +117,7 @@ Built for NUS UTown Student Life Hackathon 2026
 
 ## Credits
 
-- This project is a fork and major extension of the original work by [jloh](https://github.com/jloh). Huge thanks for the foundation and inspiration!
+- This project is a fork and major extension of the original work by [jloh](https://github.com/jloh02) and [zibo](https://github.com/zzibo). Huge thanks for the foundation and inspiration!
 
 ## License
 
