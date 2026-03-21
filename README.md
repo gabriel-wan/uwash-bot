@@ -105,7 +105,19 @@ const char* MACHINE_NAME = "Washer One";
 
 ## Team
 
+
 Built for NUS UTown Student Life Hackathon 2026
+
+## Contributors
+
+- [Shira](https://github.com/shira421) — Hardware (ESP32 integration)
+- [Wei Feng](https://github.com/Hypovolemic) — Backend, Telegram Bot
+- [Gabriel](https://github.com/gabriel-wan) — Backend, Telegram Bot
+- [Kalent](https://github.com/kccrcodes) — Dashboard (React frontend)
+
+## Credits
+
+- This project is a fork and major extension of the original work by [jloh](https://github.com/jloh). Huge thanks for the foundation and inspiration!
 
 ## License
 
