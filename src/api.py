@@ -12,6 +12,47 @@ CORS(app)
 
 MACHINES_JSON_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "machines.json")
 
+@app.route("/api/collect", methods=["POST"])
+def mark_collected():
+    """Endpoint to mark laundry as collected, clearing timer and setting machine to available."""
+    data = request.get_json()
+    if not data:
+        return jsonify({"status": "error", "message": "Invalid JSON"}), 400
+
+    house = data.get("house")
+    machine_name = data.get("machine_name")
+    telegram_id = data.get("telegram_id")  # Optional, for future user validation
+
+    # Validate house and machine_name
+    normalized_house = _normalize_house(house) if house else None
+    if not normalized_house:
+        return jsonify({"status": "error", "message": f"Invalid house. Valid: {list(constants.HOUSES.keys())}"}), 400
+    if machine_name not in constants.MACHINE_NAMES:
+        return jsonify({"status": "error", "message": f"Invalid machine_name. Valid: {constants.MACHINE_NAMES}"}), 400
+
+    # Check if machine is in idle state (optional: can allow any state)
+    now = datetime.datetime.now()
+    curr_user, end_time, _ = storage.get_laundry_timer(normalized_house, machine_name)
+    if not curr_user or not end_time or end_time > now:
+        return jsonify({"status": "error", "message": f"{machine_name} is not in idle state"}), 409
+
+    # Clear the timer and set status to available
+    storage.clear_laundry_timer(normalized_house, machine_name)
+    _sync_to_machines_json(normalized_house, machine_name, "available")
+
+    # Notify next person in queue
+    machine_type = _get_machine_kind(machine_name)
+    notified_user = _notify_next_in_queue(normalized_house, machine_type)
+
+    # Return updated status
+    return jsonify({
+        "status": "success",
+        "message": f"{machine_name} is now available",
+        "house": normalized_house,
+        "machine": machine_name,
+        "new_status": "available",
+        "notified_user": notified_user
+    }), 200
 
 @app.after_request
 def add_cors_headers(response):
@@ -48,6 +89,10 @@ def _build_machine_status(house_id: str, machine_name: str, now: datetime.dateti
     curr_user, end_time, start_time = storage.get_laundry_timer(house_id, machine_name)
     kind = _get_machine_kind(machine_name)
 
+    # Get queue length for this machine type
+    queue_data = storage.get_queue(house_id)
+    queue_length = queue_data[kind]["count"] if kind in queue_data else 0
+
     if end_time and end_time > now:
         return {
             "status": "in_use",
@@ -56,7 +101,7 @@ def _build_machine_status(house_id: str, machine_name: str, now: datetime.dateti
             "startTimeMs": int(start_time.timestamp() * 1000) if start_time else None,
             "endTime": int(end_time.timestamp() * 1000),
             "hardwareDetected": curr_user == "sensor",
-            "queueLength": 0,
+            "queueLength": queue_length,
             "cycleEndedAtMs": None,
         }
     elif end_time and end_time <= now and curr_user:
@@ -67,7 +112,7 @@ def _build_machine_status(house_id: str, machine_name: str, now: datetime.dateti
             "startTimeMs": None,
             "endTime": None,
             "hardwareDetected": curr_user == "sensor",
-            "queueLength": 0,
+            "queueLength": queue_length,
             "cycleEndedAtMs": int(end_time.timestamp() * 1000),
         }
     else:
@@ -78,7 +123,7 @@ def _build_machine_status(house_id: str, machine_name: str, now: datetime.dateti
             "startTimeMs": None,
             "endTime": None,
             "hardwareDetected": False,
-            "queueLength": 0,
+            "queueLength": queue_length,
             "cycleEndedAtMs": None,
         }
 
@@ -136,13 +181,23 @@ def update_machine():
         # The "available" POST from the sensor will clear this early when vibration stops.
         end_time = datetime.datetime.now() + datetime.timedelta(hours=2)
         storage.set_laundry_timer_sensor(house, machine_name, end_time)
+        notified_user = None
     else:
         storage.clear_laundry_timer(house, machine_name)
+        # Notify next person in queue when machine becomes available
+        machine_type = _get_machine_kind(machine_name)
+        notified_user = _notify_next_in_queue(house, machine_type)
 
     # Sync to machines.json for dashboard
     _sync_to_machines_json(house, machine_name, status)
 
-    return jsonify({"status": "ok", "house": house, "machine": machine_name, "new_status": status})
+    return jsonify({
+        "status": "ok",
+        "house": house,
+        "machine": machine_name,
+        "new_status": status,
+        "notified_user": notified_user
+    })
 
 
 @app.route("/status", methods=["GET"])
@@ -244,6 +299,132 @@ def start_cycle():
         "machine": machine_name,
         "username": username,
         "endTimeMs": int(end_time.timestamp() * 1000),
+    })
+
+
+# ============ Queue Endpoints ============
+
+def _notify_next_in_queue(house: str, machine_type: str) -> str | None:
+    """Notify next person in queue when a machine becomes available.
+    Returns the username if someone was notified, None otherwise."""
+    next_user = storage.get_next_in_queue(house, machine_type)
+    if not next_user:
+        return None
+
+    queue_id, telegram_id, username = next_user
+    storage.mark_queue_notified(queue_id)
+
+    # TODO: Send actual Telegram message via bot
+    # For now, just mark as notified and return username
+    print(f"[Queue] Notified {username} ({telegram_id}) - {machine_type} available in {house}")
+
+    return username
+
+
+@app.route("/api/queue/join", methods=["POST"])
+def join_queue():
+    """Join the queue for a machine type."""
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "Invalid JSON"}), 400
+
+    house = data.get("house")
+    machine_type = data.get("machine_type")  # 'washer' or 'dryer'
+    telegram_id = data.get("telegram_id")
+    username = data.get("username")
+
+    # Validate inputs
+    normalized_house = _normalize_house(house) if house else None
+    if not normalized_house:
+        return jsonify({"error": f"Invalid house. Valid: {list(constants.HOUSES.keys())}"}), 400
+    if machine_type not in ("washer", "dryer"):
+        return jsonify({"error": "machine_type must be 'washer' or 'dryer'"}), 400
+    if not telegram_id:
+        return jsonify({"error": "telegram_id is required"}), 400
+
+    # Join the queue
+    result = storage.join_queue(normalized_house, machine_type, telegram_id, username)
+
+    # Calculate estimated wait time
+    WAIT_TIMES = {"washer": 45, "dryer": 60}
+    estimated_wait_mins = result["position"] * WAIT_TIMES[machine_type]
+
+    return jsonify({
+        "status": result["status"],
+        "house": normalized_house,
+        "machine_type": machine_type,
+        "position": result["position"],
+        "estimated_wait_mins": estimated_wait_mins
+    })
+
+
+@app.route("/api/queue", methods=["GET"])
+def get_queue():
+    """Get queue status for a house."""
+    house = request.args.get("house")
+
+    normalized_house = _normalize_house(house) if house else None
+    if not normalized_house:
+        return jsonify({"error": f"Invalid house. Valid: {list(constants.HOUSES.keys())}"}), 400
+
+    queue_data = storage.get_queue(normalized_house)
+
+    return jsonify({
+        "house": normalized_house,
+        "washer": queue_data["washer"],
+        "dryer": queue_data["dryer"]
+    })
+
+
+@app.route("/api/queue/leave", methods=["DELETE", "POST"])
+def leave_queue():
+    """Leave the queue."""
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "Invalid JSON"}), 400
+
+    house = data.get("house")
+    telegram_id = data.get("telegram_id")
+    machine_type = data.get("machine_type")  # optional, if not provided leaves all queues
+
+    normalized_house = _normalize_house(house) if house else None
+    if not normalized_house:
+        return jsonify({"error": f"Invalid house. Valid: {list(constants.HOUSES.keys())}"}), 400
+    if not telegram_id:
+        return jsonify({"error": "telegram_id is required"}), 400
+
+    removed = storage.leave_queue(normalized_house, telegram_id, machine_type)
+
+    if removed:
+        return jsonify({"status": "success", "message": "Removed from queue"})
+    else:
+        return jsonify({"status": "not_found", "message": "User not in queue"}), 404
+
+
+@app.route("/api/queue/position", methods=["GET"])
+def get_queue_position():
+    """Get user's current position in queue."""
+    house = request.args.get("house")
+    telegram_id = request.args.get("telegram_id")
+    machine_type = request.args.get("machine_type")
+
+    normalized_house = _normalize_house(house) if house else None
+    if not normalized_house:
+        return jsonify({"error": f"Invalid house. Valid: {list(constants.HOUSES.keys())}"}), 400
+    if not telegram_id or not machine_type:
+        return jsonify({"error": "telegram_id and machine_type required"}), 400
+
+    position = storage.get_queue_position(normalized_house, machine_type, telegram_id)
+
+    WAIT_TIMES = {"washer": 45, "dryer": 60}
+    estimated_wait = position * WAIT_TIMES.get(machine_type, 45) if position > 0 else 0
+
+    return jsonify({
+        "house": normalized_house,
+        "machine_type": machine_type,
+        "position": position,
+        "in_queue": position > 0,
+        "estimated_wait_mins": estimated_wait
     })
 
 

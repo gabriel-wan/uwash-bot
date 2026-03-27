@@ -58,6 +58,20 @@ def init_database():
         )
     ''')
 
+    # Queue table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS queue (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            house TEXT NOT NULL,
+            machine_type TEXT NOT NULL,
+            telegram_id TEXT NOT NULL,
+            telegram_username TEXT,
+            joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            status TEXT DEFAULT 'waiting',
+            notified_at TIMESTAMP
+        )
+    ''')
+
     conn.commit()
     conn.close()
     print(f"[Database] Initialized at {get_db_path()}")
@@ -186,3 +200,196 @@ def read_house():
 # Initialize on import
 if __name__ != "__main__":
     init_database()
+
+
+# ============ Queue Functions ============
+
+def join_queue(house: str, machine_type: str, telegram_id: str, telegram_username: str = None) -> dict:
+    """Add user to queue. Returns position and queue info."""
+    conn = sqlite3.connect(get_db_path())
+    cursor = conn.cursor()
+
+    # Check if user already in queue for this house + machine_type
+    cursor.execute('''
+        SELECT id, status FROM queue
+        WHERE house = ? AND machine_type = ? AND telegram_id = ? AND status IN ('waiting', 'notified')
+    ''', (house, machine_type, telegram_id))
+    existing = cursor.fetchone()
+
+    if existing:
+        # Already in queue, return current position
+        position = get_queue_position(house, machine_type, telegram_id)
+        conn.close()
+        return {"status": "already_queued", "position": position}
+
+    # Add to queue
+    cursor.execute('''
+        INSERT INTO queue (house, machine_type, telegram_id, telegram_username, status)
+        VALUES (?, ?, ?, ?, 'waiting')
+    ''', (house, machine_type, telegram_id, telegram_username))
+
+    conn.commit()
+    conn.close()
+
+    # Get position
+    position = get_queue_position(house, machine_type, telegram_id)
+    return {"status": "joined", "position": position}
+
+
+def get_queue_position(house: str, machine_type: str, telegram_id: str) -> int:
+    """Get user's position in queue (1-indexed). Returns 0 if not in queue."""
+    conn = sqlite3.connect(get_db_path())
+    cursor = conn.cursor()
+
+    cursor.execute('''
+        SELECT telegram_id FROM queue
+        WHERE house = ? AND machine_type = ? AND status IN ('waiting', 'notified')
+        ORDER BY joined_at ASC
+    ''', (house, machine_type))
+
+    queue_list = cursor.fetchall()
+    conn.close()
+
+    for i, (tid,) in enumerate(queue_list, 1):
+        if tid == telegram_id:
+            return i
+    return 0
+
+
+def get_queue(house: str) -> dict:
+    """Get all queue entries for a house, grouped by machine type."""
+    conn = sqlite3.connect(get_db_path())
+    cursor = conn.cursor()
+
+    # Get washer queue
+    cursor.execute('''
+        SELECT id, telegram_id, telegram_username, joined_at, status
+        FROM queue
+        WHERE house = ? AND machine_type = 'washer' AND status IN ('waiting', 'notified')
+        ORDER BY joined_at ASC
+    ''', (house,))
+    washer_rows = cursor.fetchall()
+
+    # Get dryer queue
+    cursor.execute('''
+        SELECT id, telegram_id, telegram_username, joined_at, status
+        FROM queue
+        WHERE house = ? AND machine_type = 'dryer' AND status IN ('waiting', 'notified')
+        ORDER BY joined_at ASC
+    ''', (house,))
+    dryer_rows = cursor.fetchall()
+
+    conn.close()
+
+    # Build response with estimated wait times
+    # Assume 45 min avg for washers, 60 min for dryers
+    WASHER_AVG_MINS = 45
+    DRYER_AVG_MINS = 60
+
+    def build_queue_list(rows, avg_mins):
+        result = []
+        for i, (qid, tid, username, joined_at, status) in enumerate(rows, 1):
+            result.append({
+                "id": qid,
+                "position": i,
+                "telegram_id": tid,
+                "username": username or "Anonymous",
+                "joined_at": joined_at,
+                "status": status,
+                "estimated_wait_mins": i * avg_mins
+            })
+        return result
+
+    return {
+        "washer": {
+            "queue": build_queue_list(washer_rows, WASHER_AVG_MINS),
+            "count": len(washer_rows)
+        },
+        "dryer": {
+            "queue": build_queue_list(dryer_rows, DRYER_AVG_MINS),
+            "count": len(dryer_rows)
+        }
+    }
+
+
+def leave_queue(house: str, telegram_id: str, machine_type: str = None) -> bool:
+    """Remove user from queue. Returns True if removed, False if not found."""
+    conn = sqlite3.connect(get_db_path())
+    cursor = conn.cursor()
+
+    if machine_type:
+        cursor.execute('''
+            DELETE FROM queue
+            WHERE house = ? AND telegram_id = ? AND machine_type = ? AND status IN ('waiting', 'notified')
+        ''', (house, telegram_id, machine_type))
+    else:
+        # Remove from all queues for this house
+        cursor.execute('''
+            DELETE FROM queue
+            WHERE house = ? AND telegram_id = ? AND status IN ('waiting', 'notified')
+        ''', (house, telegram_id))
+
+    removed = cursor.rowcount > 0
+    conn.commit()
+    conn.close()
+    return removed
+
+
+def get_next_in_queue(house: str, machine_type: str) -> tuple:
+    """Get the next person in queue to notify. Returns (id, telegram_id, username) or None."""
+    conn = sqlite3.connect(get_db_path())
+    cursor = conn.cursor()
+
+    # Get first waiting person (not already notified)
+    cursor.execute('''
+        SELECT id, telegram_id, telegram_username FROM queue
+        WHERE house = ? AND machine_type = ? AND status = 'waiting'
+        ORDER BY joined_at ASC
+        LIMIT 1
+    ''', (house, machine_type))
+
+    result = cursor.fetchone()
+    conn.close()
+
+    return result  # (id, telegram_id, username) or None
+
+
+def mark_queue_notified(queue_id: int):
+    """Mark a queue entry as notified."""
+    conn = sqlite3.connect(get_db_path())
+    cursor = conn.cursor()
+
+    cursor.execute('''
+        UPDATE queue SET status = 'notified', notified_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+    ''', (queue_id,))
+
+    conn.commit()
+    conn.close()
+
+
+def remove_from_queue(queue_id: int):
+    """Remove a specific queue entry (e.g., after user claims machine)."""
+    conn = sqlite3.connect(get_db_path())
+    cursor = conn.cursor()
+
+    cursor.execute('DELETE FROM queue WHERE id = ?', (queue_id,))
+
+    conn.commit()
+    conn.close()
+
+
+def expire_old_notifications(timeout_mins: int = 10):
+    """Expire notifications older than timeout and move to next person."""
+    conn = sqlite3.connect(get_db_path())
+    cursor = conn.cursor()
+
+    cutoff = datetime.datetime.now() - datetime.timedelta(minutes=timeout_mins)
+
+    cursor.execute('''
+        UPDATE queue SET status = 'expired'
+        WHERE status = 'notified' AND notified_at < ?
+    ''', (cutoff.isoformat(),))
+
+    conn.commit()
+    conn.close()
