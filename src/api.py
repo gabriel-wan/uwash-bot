@@ -40,17 +40,28 @@ def mark_collected():
     storage.clear_laundry_timer(normalized_house, machine_name)
     _sync_to_machines_json(normalized_house, machine_name, "available")
 
-    # Notify next person in queue
+    # Assign next user in queue to this machine (type-based queue)
     machine_type = _get_machine_kind(machine_name)
-    notified_user = _notify_next_in_queue(normalized_house, machine_type)
+    next_user = storage.get_next_in_queue(normalized_house, machine_type)
+    notified_user = None
+    if next_user:
+        queue_id, telegram_id, username = next_user
+        # Remove user from all other queues of this type in this house
+        storage.leave_queue(normalized_house, telegram_id, machine_type)
+        # Assign user to this machine (start timer)
+        duration_mins = 45 if machine_type == "washer" else 60
+        end_time = datetime.datetime.now() + datetime.timedelta(minutes=duration_mins)
+        storage.set_laundry_timer(normalized_house, machine_name, username, end_time)
+        _sync_to_machines_json(normalized_house, machine_name, "in_use")
+        notified_user = username
+        # Optionally: send notification to user here
 
-    # Return updated status
     return jsonify({
         "status": "success",
         "message": f"{machine_name} is now available",
         "house": normalized_house,
         "machine": machine_name,
-        "new_status": "available",
+        "new_status": "available" if not next_user else "in_use",
         "notified_user": notified_user
     }), 200
 
