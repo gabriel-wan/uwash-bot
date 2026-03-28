@@ -4,7 +4,7 @@ import os
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import db_storage as storage
-import uwashbotbackend.constants as constants
+import constants
 from config import config
 
 app = Flask(__name__)

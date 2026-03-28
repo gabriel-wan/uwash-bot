@@ -76,7 +76,7 @@ def main():
     )
 
     # Register commands on startup
-    application.post_init = setup_bot_commands
+    # application.post_init = setup_bot_commands
 
     conv_handler = ConversationHandler(
         entry_points=[
@@ -126,7 +126,7 @@ def main():
         ),
     )
 
-    application.add_handler(conv_handler)
+    # application.add_handler(conv_handler)
     application.add_error_handler(error_handler)
 
     application.job_queue.run_repeating(
