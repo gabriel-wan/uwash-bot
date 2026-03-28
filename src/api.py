@@ -4,7 +4,7 @@ import os
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import db_storage as storage
-import constants
+import uwashbotbackend.constants as constants
 from config import config
 
 app = Flask(__name__)
@@ -72,11 +72,31 @@ def _check_api_key() -> bool:
 
 def _normalize_house(house: str) -> str | None:
     """Normalize house name to match constants (case-insensitive)."""
+    if not house:
+        return None
+
+    alias_house = constants.HOUSE_ALIASES.get(house.lower())
+    if alias_house:
+        return alias_house
+
     house_lower = house.lower()
     for h in constants.HOUSES.keys():
         if h.lower() == house_lower:
             return h
     return None
+
+
+def _normalize_college(college: str | None) -> str | None:
+    if not college:
+        return None
+    college_lower = college.lower()
+    if college_lower in constants.COLLEGE_HOUSES:
+        return college_lower
+    return None
+
+
+def _house_college(house: str) -> str:
+    return constants.HOUSE_TO_COLLEGE.get(house, "capt")
 
 
 def _get_machine_kind(machine_name: str) -> str:
@@ -236,7 +256,7 @@ def get_status():
             machines[machine_name] = _build_machine_status(house_id, machine_name, now)
 
         result[house_id] = {
-            "college": "capt",
+            "college": _house_college(house_id),
             "house": house_id,
             "lastUpdatedMs": int(now.timestamp() * 1000),
             "machines": machines,
@@ -246,11 +266,19 @@ def get_status():
 
 
 @app.route("/api/<house>/status", methods=["GET"])
-def get_house_status(house: str):
+@app.route("/api/<college>/<house>/status", methods=["GET"])
+def get_house_status(house: str, college: str | None = None):
     """Get status for a specific house in dashboard format."""
     normalized_house = _normalize_house(house)
     if not normalized_house:
         return jsonify({"error": f"Invalid house. Valid: {list(constants.HOUSES.keys())}"}), 400
+    normalized_college = _normalize_college(college)
+    if normalized_college:
+        valid_houses = constants.COLLEGE_HOUSES.get(normalized_college, [])
+        if normalized_house not in valid_houses:
+            return jsonify({
+                "error": f"House '{normalized_house}' does not belong to college '{normalized_college}'"
+            }), 400
 
     now = datetime.datetime.now()
     machines = {}
@@ -258,7 +286,7 @@ def get_house_status(house: str):
         machines[machine_name] = _build_machine_status(normalized_house, machine_name, now)
 
     return jsonify({
-        "college": "capt",
+        "college": normalized_college or _house_college(normalized_house),
         "house": normalized_house,
         "lastUpdatedMs": int(now.timestamp() * 1000),
         "machines": machines,
@@ -321,22 +349,70 @@ def _notify_next_in_queue(house: str, machine_type: str) -> str | None:
     return username
 
 
+def _build_queue_response(normalized_house: str, college: str | None = None) -> dict:
+    queue_data = storage.get_queue(normalized_house)
+    washer_queue = queue_data["washer"]["queue"]
+    dryer_queue = queue_data["dryer"]["queue"]
+    now_ms = int(datetime.datetime.now().timestamp() * 1000)
+
+    by_machine = {}
+    for machine_name in constants.MACHINE_NAMES:
+        kind = _get_machine_kind(machine_name)
+        rows = washer_queue if kind == "washer" else dryer_queue
+        by_machine[machine_name] = {
+            "queueLength": len(rows),
+            "estWaitMins": len(rows) * (45 if kind == "washer" else 60),
+            "members": [
+                {"username": row.get("username", "Anonymous"), "position": row.get("position", i + 1)}
+                for i, row in enumerate(rows)
+            ],
+        }
+
+    return {
+        # New dashboard shape
+        "college": college or _house_college(normalized_house),
+        "house": normalized_house,
+        "lastUpdatedMs": now_ms,
+        "byMachine": by_machine,
+        # Backward-compatible shape
+        "washer": queue_data["washer"],
+        "dryer": queue_data["dryer"],
+    }
+
+
 @app.route("/api/queue/join", methods=["POST"])
-def join_queue():
+@app.route("/api/join-queue", methods=["POST"])
+@app.route("/api/<house>/queue/join", methods=["POST"])
+@app.route("/api/<college>/<house>/queue/join", methods=["POST"])
+def join_queue(house: str | None = None, college: str | None = None):
     """Join the queue for a machine type."""
     data = request.get_json()
     if not data:
         return jsonify({"error": "Invalid JSON"}), 400
 
-    house = data.get("house")
+    house = data.get("house") or house
     machine_type = data.get("machine_type")  # 'washer' or 'dryer'
-    telegram_id = data.get("telegram_id")
-    username = data.get("username")
+    machine_name = data.get("machine_name") or data.get("machineId")
+    if not machine_type and machine_name:
+        machine_type = _get_machine_kind(machine_name)
 
+    username = (data.get("username") or "").strip()
+    telegram_id = (
+        data.get("telegram_id")
+        or data.get("userId")
+        or (username if username else None)
+    )
     # Validate inputs
     normalized_house = _normalize_house(house) if house else None
     if not normalized_house:
         return jsonify({"error": f"Invalid house. Valid: {list(constants.HOUSES.keys())}"}), 400
+    normalized_college = _normalize_college(data.get("college") or college)
+    if normalized_college:
+        valid_houses = constants.COLLEGE_HOUSES.get(normalized_college, [])
+        if normalized_house not in valid_houses:
+            return jsonify({
+                "error": f"House '{normalized_house}' does not belong to college '{normalized_college}'"
+            }), 400
     if machine_type not in ("washer", "dryer"):
         return jsonify({"error": "machine_type must be 'washer' or 'dryer'"}), 400
     if not telegram_id:
@@ -359,21 +435,25 @@ def join_queue():
 
 
 @app.route("/api/queue", methods=["GET"])
-def get_queue():
+@app.route("/api/<house>/queue", methods=["GET"])
+@app.route("/api/<college>/<house>/queue", methods=["GET"])
+def get_queue(house: str | None = None, college: str | None = None):
     """Get queue status for a house."""
-    house = request.args.get("house")
+    house = request.args.get("house") or house
+    college = request.args.get("college") or college
 
     normalized_house = _normalize_house(house) if house else None
     if not normalized_house:
         return jsonify({"error": f"Invalid house. Valid: {list(constants.HOUSES.keys())}"}), 400
+    normalized_college = _normalize_college(college)
+    if normalized_college:
+        valid_houses = constants.COLLEGE_HOUSES.get(normalized_college, [])
+        if normalized_house not in valid_houses:
+            return jsonify({
+                "error": f"House '{normalized_house}' does not belong to college '{normalized_college}'"
+            }), 400
 
-    queue_data = storage.get_queue(normalized_house)
-
-    return jsonify({
-        "house": normalized_house,
-        "washer": queue_data["washer"],
-        "dryer": queue_data["dryer"]
-    })
+    return jsonify(_build_queue_response(normalized_house, normalized_college))
 
 
 @app.route("/api/queue/leave", methods=["DELETE", "POST"])
