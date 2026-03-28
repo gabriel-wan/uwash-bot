@@ -52,11 +52,7 @@ for house_id in constants.HOUSES.keys():
         }
     )
 
-COMMANDS_DICT = {
-    "start": "Display help page",
-    "select": constants.SELECT_COMMAND_DESCRIPTION,
-    "status": constants.STATUS_COMMAND_DESCRIPTION,
-}
+COMMANDS_DICT = {}
 
 
 async def setup_bot_commands(application: Application):
@@ -76,7 +72,7 @@ def main():
     )
 
     # Register commands on startup
-    # application.post_init = setup_bot_commands
+    application.post_init = setup_bot_commands
 
     conv_handler = ConversationHandler(
         entry_points=[
